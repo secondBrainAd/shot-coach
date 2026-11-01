@@ -1,0 +1,266 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Shot Coach</title>
+<meta name="theme-color" content="#000000">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Shot Coach">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<style>
+  :root { color-scheme: dark; --ok:#34d399; --bad:#f87171; --acc:#3b82f6; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; height: 100%; background: #000; color: #fff; font: 15px/1.35 -apple-system, system-ui, sans-serif; overflow: hidden; }
+  #app { height: 100dvh; display: flex; flex-direction: column; }
+  .stage { flex: 1; min-height: 0; display: flex; justify-content: center; background: #000; }
+  .frame { position: relative; height: 100%; aspect-ratio: 9 / 16; max-width: 100%; }
+  canvas { width: 100%; height: 100%; display: block; }
+  .border { position: absolute; inset: 0; border: 5px solid transparent; pointer-events: none; transition: border-color .2s; }
+  .border.ok { border-color: var(--ok); } .border.bad { border-color: var(--bad); }
+  .hud { position: absolute; left: 6%; right: 6%; top: 16%; text-align: center; pointer-events: none; }
+  #say { display: inline-block; padding: 8px 16px; border-radius: 14px; background: rgba(0,0,0,.55); font-size: 22px; font-weight: 700; }
+  #say.ok { color: var(--ok); } #say.bad { color: var(--bad); }
+  #sub { margin-top: 8px; font-size: 13px; color: #dbe4ee; text-shadow: 0 1px 3px #000; }
+  .intro { position: absolute; inset: 0; display: grid; place-items: center; background: rgba(0,0,0,.82); padding: 24px; text-align: center; }
+  .intro h1 { margin: 0 0 8px; font-size: 24px; } .intro p { color: #b6c0cc; margin: 0 0 18px; }
+  .intro .small { font-size: 12px; margin: 14px 0 0; }
+  .bar { padding: 8px 10px calc(8px + env(safe-area-inset-bottom)); background: #0b0d10; border-top: 1px solid #1d232b; }
+  .chips, .btns { display: flex; gap: 8px; overflow-x: auto; padding: 2px 0; scrollbar-width: none; }
+  .btns { margin-top: 8px; }
+  button { font: inherit; font-size: 14px; font-weight: 600; border: 0; border-radius: 999px; padding: 9px 14px; background: #232830; color: #e8eaed; white-space: nowrap; flex: none; }
+  button.on { background: #1d3a66; color: #bcd6ff; }
+  button.chip.on { background: var(--acc); color: #fff; }
+  button.primary { background: var(--acc); color: #fff; }
+  button.primary.locked { background: var(--ok); color: #04261a; }
+  #start { font-size: 17px; padding: 14px 28px; background: var(--acc); color: #fff; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div class="stage">
+    <div class="frame">
+      <canvas id="view" width="540" height="960"></canvas>
+      <div class="border" id="border"></div>
+      <div class="hud"><div id="say">Tap Start camera</div><div id="sub"></div></div>
+      <div class="intro" id="intro"><div>
+        <h1>Shot Coach</h1>
+        <p>Spoken framing help on your phone. Pick a shot type, line up your eyes, then lock it.</p>
+        <button id="start">Start camera</button>
+        <p class="small" id="loadmsg">Needs internet once to load the face model.</p>
+      </div></div>
+    </div>
+  </div>
+  <div class="bar">
+    <div class="chips" id="chips"></div>
+    <div class="btns">
+      <button id="lock" class="primary">Lock</button>
+      <button id="auto" class="tog">Auto-lock</button>
+      <button id="layout" class="tog">Reels layout</button>
+      <button id="voice" class="tog">Voice</button>
+      <button id="mirror" class="tog">Mirror</button>
+      <button id="flip">Flip camera</button>
+    </div>
+  </div>
+</div>
+
+<script type="module">
+import { FaceLandmarker, FilesetResolver } from 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs';
+import { PRESETS, DRIFT, measureFraming, framingVerdict, driftVerdict } from './logic.js';
+import { drawReelsLayout, drawVisualsZone } from './reels.js';
+
+const MODEL = 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task';
+const WASM = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm';
+const $ = (id) => document.getElementById(id);
+const view = $('view'), vctx = view.getContext('2d');
+const grab = document.createElement('canvas'); grab.width = 360; grab.height = 640;
+const gctx = grab.getContext('2d');
+const video = document.createElement('video');
+video.setAttribute('playsinline', ''); video.muted = true;
+video.style.cssText = 'position:fixed;width:1px;height:1px;opacity:0;pointer-events:none';
+document.body.appendChild(video);
+
+const store = {
+  get(k, d) { try { const x = localStorage.getItem('sc.' + k); return x === null ? d : JSON.parse(x); } catch { return d; } },
+  set(k, val) { try { localStorage.setItem('sc.' + k, JSON.stringify(val)); } catch {} },
+};
+const opt = { layout: store.get('layout', true), voice: store.get('voice', true), mirror: store.get('mirror', true), autoLock: store.get('autoLock', true) };
+let preset = PRESETS[store.get('preset', 'explainer')] || PRESETS.explainer;
+let facing = 'user', stream = null, landmarker = null, running = false, lastRun = 0, lastM = null;
+let audioCtx = null, subTimer = null;
+const S = { locked: false, ref: null, okSince: 0, announcedOk: false, issueKey: null, issueSince: 0, spoken: { key: null, t: 0 }, speaking: false, driftSince: 0, drifting: false };
+
+// ---------- feedback: voice, beep, vibration ----------
+function say(text) {
+  S.speaking = true;
+  return new Promise((resolve) => {
+    let done = false;
+    const fin = () => { if (done) return; done = true; S.speaking = false; resolve(); };
+    if (!opt.voice || !('speechSynthesis' in window)) { setTimeout(fin, 600); return; }
+    speechSynthesis.cancel();
+    const u = new SpeechSynthesisUtterance(text);
+    u.onend = fin; u.onerror = fin;
+    setTimeout(fin, 3000 + text.length * 90);
+    speechSynthesis.speak(u);
+  });
+}
+function beep(kind) {
+  try {
+    audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+    o.frequency.value = kind === 'ok' ? 880 : 330; g.gain.value = 0.08;
+    o.connect(g); g.connect(audioCtx.destination); o.start(); o.stop(audioCtx.currentTime + (kind === 'ok' ? 0.12 : 0.25));
+  } catch {}
+  if (kind !== 'ok' && navigator.vibrate) navigator.vibrate(120);
+}
+function showSub(text) { $('sub').textContent = text; clearTimeout(subTimer); subTimer = setTimeout(() => { $('sub').textContent = ''; }, 6000); }
+
+// ---------- lock ----------
+function lock(m) {
+  S.locked = true; S.ref = { eyeY: m.eyeY, headHeight: m.headHeight, offset: m.offset };
+  S.driftSince = 0; S.drifting = false;
+  $('lock').textContent = 'Unlock'; $('lock').classList.add('locked');
+  beep('ok');
+  say(`Locked. Eyes at ${Math.round(m.eyeY * 100)} percent. I will tell you if it drifts.`);
+}
+function unlock(silent) {
+  S.locked = false; S.ref = null; S.okSince = 0; S.announcedOk = false; S.issueKey = null;
+  $('lock').textContent = 'Lock'; $('lock').classList.remove('locked');
+  if (!silent) say('Unlocked.');
+}
+
+function step(v, m, now) {
+  if (!S.locked) {
+    if (v.ok) {
+      S.issueKey = null;
+      if (!S.okSince) S.okSince = now;
+      if (opt.autoLock && now - S.okSince > 2000 && !S.speaking) lock(m);
+      else if (!opt.autoLock && !S.announcedOk && now - S.okSince > 1200 && !S.speaking) { S.announcedOk = true; beep('ok'); say('The shot is correct. Tap lock when you are ready.'); }
+    } else {
+      S.okSince = 0; S.announcedOk = false;
+      if (v.key !== S.issueKey) { S.issueKey = v.key; S.issueSince = now; }
+      const stable = now - S.issueSince > 900;
+      const due = v.key !== S.spoken.key || now - S.spoken.t > 7000;
+      if (stable && due && !S.speaking) { S.spoken = { key: v.key, t: now }; say(v.say); }
+    }
+  } else if (v.ok) {
+    if (S.drifting) { S.drifting = false; S.spoken = { key: null, t: 0 }; beep('ok'); say('Back in position.'); }
+    S.driftSince = 0;
+  } else {
+    if (!S.driftSince) S.driftSince = now;
+    if (now - S.driftSince > 800) {
+      S.drifting = true;
+      if ((v.key !== S.spoken.key || now - S.spoken.t > 6000) && !S.speaking) { S.spoken = { key: v.key, t: now }; beep('warn'); say(v.say); }
+    }
+  }
+}
+
+// ---------- drawing ----------
+function cover(vw, vh) {
+  let sw = vw, sh = vw * 16 / 9;
+  if (sh > vh) { sh = vh; sw = vh * 9 / 16; }
+  return [(vw - sw) / 2, (vh - sh) / 2, sw, sh];
+}
+function render(m, r) {
+  const W = view.width, H = view.height;
+  vctx.save();
+  if (opt.mirror) { vctx.translate(W, 0); vctx.scale(-1, 1); }
+  vctx.drawImage(video, ...r, 0, 0, W, H);
+  vctx.restore();
+  const band = S.locked ? [S.ref.eyeY - DRIFT.eyeY, S.ref.eyeY + DRIFT.eyeY] : preset.eyeLine;
+  vctx.fillStyle = S.locked ? '#34d39933' : '#34d39922';
+  vctx.fillRect(0, band[0] * H, W, (band[1] - band[0]) * H);
+  if (m) {
+    const inBand = m.eyeY >= band[0] && m.eyeY <= band[1];
+    vctx.strokeStyle = inBand ? '#34d399' : '#f87171'; vctx.lineWidth = 3;
+    vctx.beginPath(); vctx.moveTo(0, m.eyeY * H); vctx.lineTo(W, m.eyeY * H); vctx.stroke();
+    if (opt.layout && preset.key === 'explainer') drawVisualsZone(vctx, W, H, m.headroom);
+  }
+  if (opt.layout) drawReelsLayout(vctx, W, H);
+}
+
+// ---------- main loop ----------
+function loop() {
+  requestAnimationFrame(loop);
+  if (!running || !landmarker || video.readyState < 2) return;
+  const now = performance.now();
+  if (now - lastRun < 80) return;
+  lastRun = now;
+  const r = cover(video.videoWidth, video.videoHeight);
+  gctx.drawImage(video, ...r, 0, 0, grab.width, grab.height);
+  let m = null;
+  try {
+    const res = landmarker.detectForVideo(grab, now);
+    const lm = res.faceLandmarks && res.faceLandmarks[0];
+    m = lm ? measureFraming(lm) : null;
+  } catch (e) { console.error(e); }
+  lastM = m;
+  const v = S.locked ? driftVerdict(m, S.ref) : framingVerdict(m, preset);
+  render(m, r);
+  const sayEl = $('say');
+  sayEl.textContent = S.locked && v.ok ? `Locked at ${Math.round(S.ref.eyeY * 100)}%` : v.short;
+  sayEl.className = v.ok ? 'ok' : 'bad';
+  $('border').className = 'border ' + (v.ok ? 'ok' : 'bad');
+  step(v, m, now);
+}
+
+// ---------- camera and model ----------
+async function openCamera() {
+  if (stream) stream.getTracks().forEach((t) => t.stop());
+  stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: facing, width: { ideal: 1080 }, height: { ideal: 1920 } }, audio: false });
+  video.srcObject = stream;
+  await video.play();
+  try { await navigator.wakeLock.request('screen'); } catch {}
+}
+async function loadModel() {
+  const fileset = await FilesetResolver.forVisionTasks(WASM);
+  const o = (delegate) => ({ baseOptions: { modelAssetPath: MODEL, delegate }, runningMode: 'VIDEO', numFaces: 1 });
+  try { landmarker = await FaceLandmarker.createFromOptions(fileset, o('GPU')); }
+  catch { landmarker = await FaceLandmarker.createFromOptions(fileset, o('CPU')); }
+}
+$('start').onclick = async () => {
+  $('loadmsg').textContent = 'Starting camera and loading the face model...';
+  try {
+    if ('speechSynthesis' in window) speechSynthesis.speak(new SpeechSynthesisUtterance(''));
+    await openCamera();
+    await loadModel();
+  } catch (e) { $('loadmsg').textContent = 'Could not start: ' + (e.name || e.message) + '. Allow the camera and check your internet.'; return; }
+  $('intro').style.display = 'none';
+  running = true;
+  showSub(`${preset.label}: eyes ${Math.round(preset.eyeLine[0] * 100)} to ${Math.round(preset.eyeLine[1] * 100)}% from the top. ${preset.note}`);
+  say(`${preset.label} shot. Hold the phone where you will film.`);
+};
+
+// ---------- controls ----------
+function renderChips() {
+  $('chips').innerHTML = Object.values(PRESETS).map((p) => `<button class="chip ${p.key === preset.key ? 'on' : ''}" data-k="${p.key}">${p.label}</button>`).join('');
+}
+$('chips').onclick = (e) => {
+  const k = e.target.dataset.k; if (!k) return;
+  preset = PRESETS[k]; store.set('preset', k);
+  if (S.locked) unlock(true);
+  S.okSince = 0; S.announcedOk = false; S.issueKey = null;
+  renderChips();
+  showSub(`${preset.label}: eyes ${Math.round(preset.eyeLine[0] * 100)} to ${Math.round(preset.eyeLine[1] * 100)}% from the top. ${preset.note}`);
+};
+renderChips();
+$('lock').onclick = () => {
+  if (S.locked) { unlock(false); return; }
+  if (!lastM) { say("I can't see your face yet."); return; }
+  lock(lastM);
+};
+for (const [id, key] of [['auto', 'autoLock'], ['layout', 'layout'], ['voice', 'voice'], ['mirror', 'mirror']]) {
+  const b = $(id); b.classList.toggle('on', opt[key]);
+  b.onclick = () => { opt[key] = !opt[key]; store.set(key, opt[key]); b.classList.toggle('on', opt[key]); };
+}
+$('flip').onclick = async () => {
+  facing = facing === 'user' ? 'environment' : 'user';
+  opt.mirror = facing === 'user'; $('mirror').classList.toggle('on', opt.mirror);
+  if (running) { try { await openCamera(); } catch (e) { showSub('Could not switch camera: ' + e.name); } }
+};
+loop();
+</script>
+</body>
+</html>
